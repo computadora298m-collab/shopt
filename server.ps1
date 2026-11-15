@@ -40,6 +40,72 @@ function Write-JsonResponse {
     Write-Response -Response $Response -StatusCode $StatusCode -ContentType 'application/json; charset=utf-8' -Body $body
 }
 
+function Read-Database {
+    if (-not (Test-Path -LiteralPath $databasePath)) {
+        return [PSCustomObject]@{ values = [PSCustomObject]@{} }
+    }
+
+    $database = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($databasePath, [System.Text.Encoding]::UTF8))
+    if ($null -eq $database.values) {
+        throw 'El archivo de datos de la tienda no contiene el objeto values.'
+    }
+    return $database
+}
+
+function Save-Database {
+    param([object]$Database)
+
+    $temporaryPath = "$databasePath.$([Guid]::NewGuid().ToString('N')).tmp"
+    $backupPath = "$temporaryPath.bak"
+    try {
+        $json = ConvertTo-Json -InputObject $Database -Depth 30
+        [System.IO.File]::WriteAllText($temporaryPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+        if (Test-Path -LiteralPath $databasePath) {
+            [System.IO.File]::Replace($temporaryPath, $databasePath, $backupPath)
+        } else {
+            [System.IO.File]::Move($temporaryPath, $databasePath)
+        }
+    } finally {
+        foreach ($pathToClean in @($temporaryPath, $backupPath)) {
+            if (Test-Path -LiteralPath $pathToClean) {
+                Remove-Item -LiteralPath $pathToClean -Force
+            }
+        }
+    }
+}
+
+function Read-JsonRequestBody {
+    param(
+        [System.Net.HttpListenerContext]$Context,
+        [long]$MaximumBytes
+    )
+
+    if ($Context.Request.ContentLength64 -gt $MaximumBytes) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 413 -Data @{ error = 'Los datos enviados superan el límite permitido.' }
+        return $null
+    }
+    if ($Context.Request.ContentType -notlike 'application/json*') {
+        Write-JsonResponse -Response $Context.Response -StatusCode 415 -Data @{ error = 'El formato de la solicitud no es válido.' }
+        return $null
+    }
+
+    $reader = New-Object -TypeName System.IO.StreamReader -ArgumentList @($Context.Request.InputStream, $Context.Request.ContentEncoding)
+    try {
+        $requestData = ConvertFrom-Json -InputObject $reader.ReadToEnd()
+    } catch {
+        Write-JsonResponse -Response $Context.Response -StatusCode 400 -Data @{ error = 'No se pudieron leer los datos enviados.' }
+        return $null
+    } finally {
+        $reader.Dispose()
+    }
+
+    if ($null -eq $requestData -or $requestData -isnot [PSCustomObject]) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 400 -Data @{ error = 'El contenido enviado no es válido.' }
+        return $null
+    }
+    return $requestData
+}
+
 function Invoke-DataRequest {
     param([System.Net.HttpListenerContext]$Context)
 
@@ -97,22 +163,233 @@ function Invoke-DataRequest {
     }
 
     $values | Add-Member -MemberType NoteProperty -Name $requestData.key -Value $requestData.value -Force
-    $temporaryPath = "$databasePath.$([Guid]::NewGuid().ToString('N')).tmp"
-    try {
-        $json = ConvertTo-Json -InputObject $database -Depth 30
-        [System.IO.File]::WriteAllText($temporaryPath, $json, (New-Object System.Text.UTF8Encoding($false)))
-        if (Test-Path -LiteralPath $databasePath) {
-            [System.IO.File]::Replace($temporaryPath, $databasePath, $null)
-        } else {
-            [System.IO.File]::Move($temporaryPath, $databasePath)
-        }
-    } finally {
-        if (Test-Path -LiteralPath $temporaryPath) {
-            Remove-Item -LiteralPath $temporaryPath -Force
-        }
+    Save-Database -Database $database
+    Write-JsonResponse -Response $Context.Response -StatusCode 200 -Data @{ saved = $true }
+}
+
+function Invoke-GoogleAuthRequest {
+    param([System.Net.HttpListenerContext]$Context)
+
+    if ($Context.Request.HttpMethod -ne 'POST') {
+        Write-JsonResponse -Response $Context.Response -StatusCode 405 -Data @{ error = 'Método no permitido.' }
+        return
     }
 
-    Write-JsonResponse -Response $Context.Response -StatusCode 200 -Data @{ saved = $true }
+    $requestData = Read-JsonRequestBody -Context $Context -MaximumBytes 16384
+    if ($null -eq $requestData) { return }
+    if ($requestData.credential -isnot [string] -or $requestData.credential.Length -gt 12000) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 400 -Data @{ error = 'La credencial de Google no es válida.' }
+        return
+    }
+
+    $database = Read-Database
+    $values = $database.values
+    $siteConfigJson = $values.site_config_v1
+    if ($siteConfigJson -isnot [string]) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 503 -Data @{ error = 'Administración debe configurar el Client ID de Google.' }
+        return
+    }
+    $siteConfig = ConvertFrom-Json -InputObject $siteConfigJson
+    $clientId = [string]$siteConfig.googleClientId
+    if ([string]::IsNullOrWhiteSpace($clientId)) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 503 -Data @{ error = 'Administración debe configurar el Client ID de Google.' }
+        return
+    }
+
+    try {
+        $tokenInfoUri = 'https://oauth2.googleapis.com/tokeninfo?id_token=' + [uri]::EscapeDataString($requestData.credential)
+        $googleUser = Invoke-RestMethod -Uri $tokenInfoUri -Method Get -TimeoutSec 20 -UseBasicParsing
+    } catch {
+        Write-Warning 'Google rechazó o no pudo verificar la credencial enviada.'
+        Write-JsonResponse -Response $Context.Response -StatusCode 502 -Data @{ error = 'Google no pudo verificar la cuenta. Inténtalo de nuevo.' }
+        return
+    }
+
+    if ($googleUser.aud -ne $clientId -or "$($googleUser.email_verified)".ToLowerInvariant() -ne 'true' -or
+        [string]::IsNullOrWhiteSpace([string]$googleUser.email) -or [string]::IsNullOrWhiteSpace([string]$googleUser.sub)) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 401 -Data @{ error = 'La cuenta de Google no pudo verificarse para esta tienda.' }
+        return
+    }
+
+    $email = ([string]$googleUser.email).Trim().ToLowerInvariant()
+    $users = @()
+    if ($values.users_v1 -is [string]) {
+        $users = ConvertFrom-Json -InputObject $values.users_v1
+    }
+    $user = $users | Where-Object { $_.email -and $_.email.Equals($email, [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+    if ($user -and $user.role -ne 'customer') {
+        Write-JsonResponse -Response $Context.Response -StatusCode 403 -Data @{ error = 'El acceso con Google está disponible solo para clientes.' }
+        return
+    }
+    if ($user -and ($user.status -eq 'frozen' -or $user.status -eq 'paused')) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 403 -Data @{ error = 'La cuenta de cliente está suspendida. Contacta al Administrador.' }
+        return
+    }
+    if ($user -and $user.googleSub -and $user.googleSub -ne $googleUser.sub) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 403 -Data @{ error = 'Esta cuenta ya está vinculada a otra cuenta de Google.' }
+        return
+    }
+
+    if (-not $user) {
+        $name = if ([string]::IsNullOrWhiteSpace([string]$googleUser.name)) { $email } else { [string]$googleUser.name }
+        $user = [PSCustomObject]@{
+            dni = ''
+            email = $email
+            pass = ''
+            name = $name
+            role = 'customer'
+            status = 'active'
+            googleSub = [string]$googleUser.sub
+        }
+        $users = @($users) + @($user)
+    } else {
+        $user | Add-Member -MemberType NoteProperty -Name googleSub -Value ([string]$googleUser.sub) -Force
+    }
+
+    $usersJson = ConvertTo-Json -InputObject ([object[]]$users) -Depth 30 -Compress
+    $values | Add-Member -MemberType NoteProperty -Name users_v1 -Value $usersJson -Force
+    Save-Database -Database $database
+    Write-JsonResponse -Response $Context.Response -StatusCode 200 -Data @{ user = $user; users = @($users) }
+}
+
+function Invoke-CreateOrderRequest {
+    param([System.Net.HttpListenerContext]$Context)
+
+    if ($Context.Request.HttpMethod -ne 'POST') {
+        Write-JsonResponse -Response $Context.Response -StatusCode 405 -Data @{ error = 'Método no permitido.' }
+        return
+    }
+
+    $requestData = Read-JsonRequestBody -Context $Context -MaximumBytes 131072
+    if ($null -eq $requestData) { return }
+    if ($requestData.requestId -isnot [string] -or [string]::IsNullOrWhiteSpace($requestData.requestId) -or $requestData.requestId.Length -gt 100 -or
+        $requestData.customerEmail -isnot [string] -or $requestData.customerEmail.Length -gt 254) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 400 -Data @{ error = 'La solicitud del pedido no es válida.' }
+        return
+    }
+
+    $database = Read-Database
+    $values = $database.values
+    $users = @()
+    if ($values.users_v1 -is [string]) {
+        $users = ConvertFrom-Json -InputObject $values.users_v1
+    }
+    $customerEmail = $requestData.customerEmail.Trim().ToLowerInvariant()
+    $user = $users | Where-Object { $_.email -and $_.email.Equals($customerEmail, [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+    if (-not $user -or $user.role -ne 'customer' -or $user.status -eq 'frozen' -or $user.status -eq 'paused') {
+        Write-JsonResponse -Response $Context.Response -StatusCode 403 -Data @{ error = 'Inicia sesión con una cuenta de cliente activa para realizar el pedido.' }
+        return
+    }
+
+    if ($values.site_config_v1 -isnot [string]) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 409 -Data @{ error = 'Administración debe configurar la dirección de la sucursal o punto de retiro.' }
+        return
+    }
+    $siteConfig = ConvertFrom-Json -InputObject $values.site_config_v1
+    $pickupAddress = ([string]$siteConfig.branchAddress).Trim()
+    if ([string]::IsNullOrWhiteSpace($pickupAddress)) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 409 -Data @{ error = 'Administración debe configurar la dirección de la sucursal o punto de retiro.' }
+        return
+    }
+
+    $orders = @()
+    if ($values.orders_v1 -is [string]) {
+        $orders = ConvertFrom-Json -InputObject $values.orders_v1
+    }
+    $archivedOrders = @()
+    if ($values.archived_orders_v1 -is [string]) {
+        $archivedOrders = ConvertFrom-Json -InputObject $values.archived_orders_v1
+    }
+    $products = @()
+    if ($values.products_v1 -is [string]) {
+        $products = ConvertFrom-Json -InputObject $values.products_v1
+    }
+
+    $existingOrder = @($orders) + @($archivedOrders) |
+        Where-Object { $_.requestId -eq $requestData.requestId -and $_.customerEmail -and $_.customerEmail.Equals($customerEmail, [System.StringComparison]::OrdinalIgnoreCase) } |
+        Select-Object -First 1
+    if ($existingOrder) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 200 -Data @{ order = $existingOrder; orders = @($orders); products = @($products) }
+        return
+    }
+
+    $requestedItems = @($requestData.items)
+    if ($requestedItems.Count -lt 1 -or $requestedItems.Count -gt 100) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 400 -Data @{ error = 'El pedido debe contener entre 1 y 100 productos.' }
+        return
+    }
+
+    $orderItems = @()
+    $seenProductIds = @{}
+    $total = 0
+    foreach ($requestedItem in $requestedItems) {
+        if ($null -eq $requestedItem.id -or "$($requestedItem.qty)" -notmatch '^\d+$') {
+            Write-JsonResponse -Response $Context.Response -StatusCode 400 -Data @{ error = 'Los productos o cantidades del pedido no son válidos.' }
+            return
+        }
+        $productId = [string]$requestedItem.id
+        $quantity = [int]$requestedItem.qty
+        if ($quantity -lt 1 -or $quantity -gt 1000 -or $seenProductIds.ContainsKey($productId)) {
+            Write-JsonResponse -Response $Context.Response -StatusCode 400 -Data @{ error = 'La cantidad de productos del pedido no es válida.' }
+            return
+        }
+        $seenProductIds[$productId] = $true
+        $product = $products | Where-Object { [string]$_.id -eq $productId } | Select-Object -First 1
+        if (-not $product -or [int]$product.stock -lt $quantity) {
+            Write-JsonResponse -Response $Context.Response -StatusCode 409 -Data @{ error = 'El stock cambió. Actualiza el catálogo y revisa tu carrito.' }
+            return
+        }
+
+        $price = [int][Math]::Round([double]$product.price)
+        $cost = $null
+        if ($null -ne $product.cost -and "$($product.cost)" -ne '') {
+            $cost = [int][Math]::Round([double]$product.cost)
+        }
+        $orderItems += [PSCustomObject]@{
+            id = $product.id
+            name = [string]$product.name
+            qty = $quantity
+            price = $price
+            cost = $cost
+        }
+        $total += $price * $quantity
+    }
+
+    $sequence = 0
+    if ($null -ne $values.order_sequence) {
+        $sequence = [int]$values.order_sequence
+    }
+    foreach ($existing in @($orders) + @($archivedOrders)) {
+        if ([string]$existing.id -match '^Orden\s+(\d+)$') {
+            $sequence = [Math]::Max($sequence, [int]$Matches[1])
+        }
+    }
+    $sequence++
+    $order = [PSCustomObject]@{
+        id = 'Orden {0:D2}' -f $sequence
+        requestId = $requestData.requestId
+        customer = [string]$user.name
+        customerEmail = $customerEmail
+        items = $orderItems
+        total = $total
+        status = 'Pendiente'
+        date = Get-Date -Format 'yyyy-MM-dd HH:mm'
+        paymentMethod = 'Pago en sucursal o punto de retiro'
+        pickupAddress = $pickupAddress
+    }
+
+    foreach ($product in $products) {
+        $orderedItem = $orderItems | Where-Object { [string]$_.id -eq [string]$product.id } | Select-Object -First 1
+        if ($orderedItem) {
+            $product.stock = [int]$product.stock - [int]$orderedItem.qty
+        }
+    }
+    $newOrders = @($order) + @($orders)
+    $values | Add-Member -MemberType NoteProperty -Name orders_v1 -Value (ConvertTo-Json -InputObject $newOrders -Depth 30 -Compress) -Force
+    $values | Add-Member -MemberType NoteProperty -Name products_v1 -Value (ConvertTo-Json -InputObject ([object[]]$products) -Depth 30 -Compress) -Force
+    $values | Add-Member -MemberType NoteProperty -Name order_sequence -Value $sequence -Force
+    Save-Database -Database $database
+    Write-JsonResponse -Response $Context.Response -StatusCode 201 -Data @{ order = $order; orders = $newOrders; products = @($products) }
 }
 
 function Invoke-GeminiRequest {
@@ -256,12 +533,20 @@ try {
 
             if ($path -eq '/api/data') {
                 Invoke-DataRequest -Context $context
+            } elseif ($path -eq '/api/orders') {
+                Invoke-CreateOrderRequest -Context $context
+            } elseif ($path -eq '/api/google-auth') {
+                Invoke-GoogleAuthRequest -Context $context
             } elseif ($path -eq '/api/gemini') {
                 if ($context.Request.HttpMethod -ne 'POST') {
                     Write-JsonResponse -Response $context.Response -StatusCode 405 -Data @{ error = 'Método no permitido.' }
                 } else {
                     Invoke-GeminiRequest -Context $context
                 }
+            } elseif ($path -eq '/js/app.js' -and $context.Request.HttpMethod -eq 'GET') {
+                $scriptPath = Join-Path $baseDirectory 'js\app.js'
+                $script = [System.IO.File]::ReadAllText($scriptPath, [System.Text.Encoding]::UTF8)
+                Write-Response -Response $context.Response -StatusCode 200 -ContentType 'application/javascript; charset=utf-8' -Body $script
             } elseif (($path -eq '/' -or $path -eq '/indexl.html') -and $context.Request.HttpMethod -eq 'GET') {
                 $htmlPath = Join-Path $baseDirectory 'indexl.html'
                 $html = [System.IO.File]::ReadAllText($htmlPath, [System.Text.Encoding]::UTF8)
