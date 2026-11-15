@@ -1,0 +1,30 @@
+[build]
+  # Overrides the project-level base directory setting (which contains an invalid value).
+  base = "/"
+  # Static site served from the repository root; no build step required.
+  publish = "."
+
+# The storefront entry page is indexl.html; serve it at the site root.
+[[redirects]]
+  from = "/"
+  to = "/indexl.html"
+  status = 200
+
+# Keep local-only server files and the local data file from being publicly served.
+[[redirects]]
+  from = "/tienda-data.json"
+  to = "/404"
+  status = 404
+  force = true
+
+[[redirects]]
+  from = "/server.ps1"
+  to = "/404"
+  status = 404
+  force = true
+
+[[redirects]]
+  from = "/assistant-instructions.txt"
+  to = "/404"
+  status = 404
+  force = true
