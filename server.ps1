@@ -6,6 +6,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $baseDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $databasePath = Join-Path $baseDirectory 'tienda-data.json'
+$assistantInstructionsPath = Join-Path $baseDirectory 'assistant-instructions.txt'
+$assistantCasesPath = Join-Path $baseDirectory 'assistant-cases.json'
 $sharedStorageKeys = @('users_v1', 'products_v1', 'orders_v1', 'archived_orders_v1', 'site_config_v1')
 $listener = New-Object System.Net.HttpListener
 if ($AllowNetwork) {
@@ -186,13 +188,13 @@ function Invoke-GoogleAuthRequest {
     $values = $database.values
     $siteConfigJson = $values.site_config_v1
     if ($siteConfigJson -isnot [string]) {
-        Write-JsonResponse -Response $Context.Response -StatusCode 503 -Data @{ error = 'Administración debe configurar el Client ID de Google.' }
+        Write-JsonResponse -Response $Context.Response -StatusCode 503 -Data @{ error = 'El inicio con Google todavía no está habilitado para esta tienda.' }
         return
     }
     $siteConfig = ConvertFrom-Json -InputObject $siteConfigJson
     $clientId = [string]$siteConfig.googleClientId
     if ([string]::IsNullOrWhiteSpace($clientId)) {
-        Write-JsonResponse -Response $Context.Response -StatusCode 503 -Data @{ error = 'Administración debe configurar el Client ID de Google.' }
+        Write-JsonResponse -Response $Context.Response -StatusCode 503 -Data @{ error = 'El inicio con Google todavía no está habilitado para esta tienda.' }
         return
     }
 
@@ -230,6 +232,7 @@ function Invoke-GoogleAuthRequest {
         return
     }
 
+    $created = $false
     if (-not $user) {
         $name = if ([string]::IsNullOrWhiteSpace([string]$googleUser.name)) { $email } else { [string]$googleUser.name }
         $user = [PSCustomObject]@{
@@ -242,6 +245,7 @@ function Invoke-GoogleAuthRequest {
             googleSub = [string]$googleUser.sub
         }
         $users = @($users) + @($user)
+        $created = $true
     } else {
         $user | Add-Member -MemberType NoteProperty -Name googleSub -Value ([string]$googleUser.sub) -Force
     }
@@ -249,7 +253,7 @@ function Invoke-GoogleAuthRequest {
     $usersJson = ConvertTo-Json -InputObject ([object[]]$users) -Depth 30 -Compress
     $values | Add-Member -MemberType NoteProperty -Name users_v1 -Value $usersJson -Force
     Save-Database -Database $database
-    Write-JsonResponse -Response $Context.Response -StatusCode 200 -Data @{ user = $user; users = @($users) }
+    Write-JsonResponse -Response $Context.Response -StatusCode 200 -Data @{ user = $user; users = @($users); created = $created }
 }
 
 function Invoke-CreateOrderRequest {
@@ -392,6 +396,109 @@ function Invoke-CreateOrderRequest {
     Write-JsonResponse -Response $Context.Response -StatusCode 201 -Data @{ order = $order; orders = $newOrders; products = @($products) }
 }
 
+function Test-AssistantAdminAuthorization {
+    param([System.Net.HttpListenerContext]$Context)
+
+    $email = [string]$Context.Request.Headers['X-Admin-Email']
+    $password = [string]$Context.Request.Headers['X-Admin-Password']
+    if ([string]::IsNullOrWhiteSpace($email) -or [string]::IsNullOrEmpty($password)) {
+        return $false
+    }
+
+    $database = Read-Database
+    if ($database.values.users_v1 -isnot [string]) {
+        return $false
+    }
+    $users = ConvertFrom-Json -InputObject $database.values.users_v1
+    $user = @($users | Where-Object {
+        $_.email -and $_.email.Equals($email, [System.StringComparison]::OrdinalIgnoreCase)
+    } | Select-Object -First 1)
+    if ($user.Count -eq 0) {
+        return $false
+    }
+
+    return $user[0].role -eq 'admin' -and $user[0].status -eq 'active' -and
+        [string]$user[0].pass -ceq $password
+}
+
+function Save-AssistantCases {
+    param([object[]]$Cases)
+
+    $temporaryPath = "$assistantCasesPath.$([Guid]::NewGuid().ToString('N')).tmp"
+    $backupPath = "$temporaryPath.bak"
+    try {
+        $json = ConvertTo-Json -InputObject @($Cases) -Depth 10
+        [System.IO.File]::WriteAllText($temporaryPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+        if (Test-Path -LiteralPath $assistantCasesPath) {
+            [System.IO.File]::Replace($temporaryPath, $assistantCasesPath, $backupPath)
+        } else {
+            [System.IO.File]::Move($temporaryPath, $assistantCasesPath)
+        }
+    } finally {
+        foreach ($pathToClean in @($temporaryPath, $backupPath)) {
+            if (Test-Path -LiteralPath $pathToClean) {
+                Remove-Item -LiteralPath $pathToClean -Force
+            }
+        }
+    }
+}
+
+function Invoke-AssistantCasesRequest {
+    param([System.Net.HttpListenerContext]$Context)
+
+    if ($Context.Request.HttpMethod -notin @('GET', 'PUT')) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 405 -Data @{ error = 'Método no permitido.' }
+        return
+    }
+    if (-not (Test-AssistantAdminAuthorization -Context $Context)) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 403 -Data @{ error = 'Se requiere una sesión activa de Administrador General.' }
+        return
+    }
+
+    if ($Context.Request.HttpMethod -eq 'GET') {
+        $cases = @()
+        if (Test-Path -LiteralPath $assistantCasesPath) {
+            $storedCases = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($assistantCasesPath, [System.Text.Encoding]::UTF8))
+            if ($null -ne $storedCases) {
+                $cases = @($storedCases)
+            }
+        }
+        Write-JsonResponse -Response $Context.Response -StatusCode 200 -Data @{ cases = $cases }
+        return
+    }
+
+    $requestData = Read-JsonRequestBody -Context $Context -MaximumBytes 4096
+    if ($null -eq $requestData) { return }
+    if ($requestData.caseId -isnot [string] -or $requestData.caseId.Length -gt 80 -or $requestData.status -ne 'resolved') {
+        Write-JsonResponse -Response $Context.Response -StatusCode 400 -Data @{ error = 'La actualización del caso no es válida.' }
+        return
+    }
+
+    $cases = @()
+    if (Test-Path -LiteralPath $assistantCasesPath) {
+        $storedCases = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($assistantCasesPath, [System.Text.Encoding]::UTF8))
+        if ($null -ne $storedCases) {
+            $cases = @($storedCases)
+        }
+    }
+    $case = $cases | Where-Object { $_.id -eq $requestData.caseId } | Select-Object -First 1
+    if (-not $case) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 404 -Data @{ error = 'No se encontró el caso de asistencia.' }
+        return
+    }
+
+    $case.status = 'resolved'
+    $case.resolvedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    try {
+        Save-AssistantCases -Cases $cases
+    } catch {
+        Write-Error "Could not update assistant case: $($_.Exception.Message)"
+        Write-JsonResponse -Response $Context.Response -StatusCode 500 -Data @{ error = 'No se pudo actualizar el caso de asistencia.' }
+        return
+    }
+    Write-JsonResponse -Response $Context.Response -StatusCode 200 -Data @{ cases = $cases }
+}
+
 function Invoke-GeminiRequest {
     param([System.Net.HttpListenerContext]$Context)
 
@@ -402,25 +509,13 @@ function Invoke-GeminiRequest {
         return
     }
 
-    if ($Context.Request.ContentLength64 -gt 32768) {
+    if ($Context.Request.ContentLength64 -gt 131072) {
         Write-JsonResponse -Response $Context.Response -StatusCode 413 -Data @{ error = 'La consulta es demasiado grande.' }
         return
     }
 
-    if ($Context.Request.ContentType -notlike 'application/json*') {
-        Write-JsonResponse -Response $Context.Response -StatusCode 415 -Data @{ error = 'El formato de la solicitud no es válido.' }
-        return
-    }
-
-    $reader = New-Object -TypeName System.IO.StreamReader -ArgumentList @($Context.Request.InputStream, $Context.Request.ContentEncoding)
-    try {
-        $requestData = ConvertFrom-Json -InputObject $reader.ReadToEnd()
-    } catch {
-        Write-JsonResponse -Response $Context.Response -StatusCode 400 -Data @{ error = 'No se pudo leer el mensaje enviado.' }
-        return
-    } finally {
-        $reader.Dispose()
-    }
+    $requestData = Read-JsonRequestBody -Context $Context -MaximumBytes 131072
+    if ($null -eq $requestData) { return }
 
     if ($requestData.message -isnot [string] -or [string]::IsNullOrWhiteSpace($requestData.message) -or $requestData.message.Length -gt 2000) {
         Write-JsonResponse -Response $Context.Response -StatusCode 400 -Data @{ error = 'Escribe una pregunta de hasta 2000 caracteres.' }
@@ -432,9 +527,33 @@ function Invoke-GeminiRequest {
         return
     }
 
+    $history = @($requestData.history)
+    if ($history.Count -gt 12) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 400 -Data @{ error = 'La conversación enviada supera el límite permitido.' }
+        return
+    }
+    foreach ($turn in $history) {
+        if ($turn.role -notin @('user', 'model') -or $turn.text -isnot [string] -or $turn.text.Length -gt 5000) {
+            Write-JsonResponse -Response $Context.Response -StatusCode 400 -Data @{ error = 'El historial de conversación no es válido.' }
+            return
+        }
+    }
+
+    $customerName = [string]$requestData.customerName
+    if ($customerName.Length -gt 100) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 400 -Data @{ error = 'El nombre del cliente supera el límite permitido.' }
+        return
+    }
+
     $products = @($requestData.products)
     if ($products.Count -gt 100) {
         Write-JsonResponse -Response $Context.Response -StatusCode 400 -Data @{ error = 'El catálogo enviado supera el límite permitido.' }
+        return
+    }
+
+    $orders = @($requestData.orders)
+    if ($orders.Count -gt 10) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 400 -Data @{ error = 'El historial de pedidos enviado supera el límite permitido.' }
         return
     }
 
@@ -442,28 +561,101 @@ function Invoke-GeminiRequest {
         foreach ($product in $products) {
             if ($product.name -is [string]) {
                 $description = if ($product.description -is [string]) { $product.description } else { '' }
-                "- $($product.name) (`$$($product.price)): $description (Stock: $($product.stock))"
+                $category = if ($product.category -is [string]) { $product.category } else { 'Sin categoría' }
+                "- $($product.name) | Categoría: $category | Precio: `$$($product.price) | Stock: $($product.stock) | Descripción: $description"
             }
         }
     )
     $catalog = if ($catalogLines.Count -gt 0) { $catalogLines -join "`n" } else { 'No hay productos disponibles.' }
-    $prompt = "Catálogo de la tienda $($requestData.siteName):`n$catalog`n`nPregunta del cliente: $($requestData.message)"
+    $orderLines = @(
+        foreach ($order in $orders) {
+            if ($order.id -is [string]) {
+                $itemLines = @(
+                    foreach ($item in @($order.items)) {
+                        if ($item.name -is [string]) {
+                            "$($item.name) x$($item.qty)"
+                        }
+                    }
+                )
+                $date = if ($order.date -is [string]) { $order.date } else { '' }
+                $status = if ($order.status -is [string]) { $order.status } else { '' }
+                "Pedido $($order.id) | Fecha: $date | Estado: $status | Artículos: $($itemLines -join ', ')"
+            }
+        }
+    )
+    $orderContext = if ($orderLines.Count -gt 0) { $orderLines -join "`n" } else { 'No hay pedidos previos disponibles.' }
+
+    if (-not (Test-Path -LiteralPath $assistantInstructionsPath)) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 500 -Data @{ error = 'No se encontró el archivo de instrucciones del asistente.' }
+        return
+    }
+    try {
+        $database = Read-Database
+        $siteConfig = [PSCustomObject]@{}
+        if ($database.values.site_config_v1 -is [string]) {
+            $siteConfig = ConvertFrom-Json -InputObject $database.values.site_config_v1
+        }
+        $systemInstruction = [System.IO.File]::ReadAllText($assistantInstructionsPath, [System.Text.Encoding]::UTF8)
+    } catch {
+        Write-Error "Could not load assistant configuration: $($_.Exception.Message)"
+        Write-JsonResponse -Response $Context.Response -StatusCode 500 -Data @{ error = 'No se pudieron cargar las instrucciones del asistente.' }
+        return
+    }
+
+    $shippingPolicy = [string]$siteConfig.assistantShippingPolicy
+    if ([string]::IsNullOrWhiteSpace($shippingPolicy)) {
+        $shippingPolicy = 'No configurados. No inventes condiciones y deriva la consulta a Administración General.'
+    }
+    $paymentPolicy = [string]$siteConfig.assistantPaymentPolicy
+    if ([string]::IsNullOrWhiteSpace($paymentPolicy)) {
+        $paymentPolicy = 'No configurados. No inventes métodos y deriva la consulta a Administración General.'
+    }
+    $customInstructions = ''
+    if ($null -ne $siteConfig.assistantCustomInstructions) {
+        if ($siteConfig.assistantCustomInstructions -isnot [string] -or $siteConfig.assistantCustomInstructions.Length -gt 3000) {
+            Write-JsonResponse -Response $Context.Response -StatusCode 400 -Data @{ error = 'Las instrucciones adicionales del asistente no son válidas.' }
+            return
+        }
+        $customInstructions = $siteConfig.assistantCustomInstructions.Trim()
+    }
+    $systemInstruction = $systemInstruction.Replace('{{STORE_NAME}}', $requestData.siteName)
+    $systemInstruction = $systemInstruction.Replace('{{SHIPPING_POLICY}}', $shippingPolicy)
+    $systemInstruction = $systemInstruction.Replace('{{PAYMENT_POLICY}}', $paymentPolicy)
+    if (-not [string]::IsNullOrWhiteSpace($customInstructions)) {
+        $systemInstruction += "`n`nINSTRUCCIONES ADICIONALES CONFIGURADAS POR LA TIENDA:`n$customInstructions"
+    }
+
+    $contents = @(
+        foreach ($turn in $history) {
+            @{
+                role = $turn.role
+                parts = @(@{ text = $turn.text })
+            }
+        }
+    )
+    $currentPrompt = @"
+CATÁLOGO ACTUAL:
+$catalog
+
+CLIENTE: $(if ([string]::IsNullOrWhiteSpace($customerName)) { 'No identificado' } else { $customerName })
+HISTORIAL DE PEDIDOS DEL CLIENTE:
+$orderContext
+
+MENSAJE ACTUAL:
+$($requestData.message)
+"@
+    $contents += @{
+        role = 'user'
+        parts = @(@{ text = $currentPrompt })
+    }
 
     $payload = @{
-        contents = @(
-            @{
-                parts = @(@{ text = $prompt })
-            }
-        )
+        contents = $contents
         systemInstruction = @{
-            parts = @(
-                @{
-                    text = "Eres el asistente de compras de $($requestData.siteName). Responde en español, de forma amable y concisa. Recomienda únicamente productos que aparezcan en el catálogo. No inventes precios ni disponibilidad."
-                }
-            )
+            parts = @(@{ text = $systemInstruction })
         }
         generationConfig = @{
-            maxOutputTokens = 500
+            maxOutputTokens = 900
             temperature = 0.6
         }
     }
@@ -485,7 +677,6 @@ function Invoke-GeminiRequest {
             return
         }
 
-        Write-JsonResponse -Response $Context.Response -StatusCode 200 -Data @{ text = $answer }
     } catch {
         $providerStatus = 0
         if ($_.Exception.Response) {
@@ -501,7 +692,56 @@ function Invoke-GeminiRequest {
         }
         Write-Warning "Gemini request failed with HTTP status $providerStatus."
         Write-JsonResponse -Response $Context.Response -StatusCode 502 -Data @{ error = $message }
+        return
     }
+
+    if ([string]::IsNullOrWhiteSpace($answer)) {
+        Write-JsonResponse -Response $Context.Response -StatusCode 502 -Data @{ error = 'Gemini no devolvió una respuesta. Inténtalo de nuevo.' }
+        return
+    }
+
+    $publicAnswer = $answer.Trim()
+    $marker = '#DERIVAR_ADMIN'
+    $markerIndex = $answer.IndexOf($marker, [System.StringComparison]::Ordinal)
+    if ($markerIndex -ge 0) {
+        $internalNote = $answer.Substring($markerIndex).Trim()
+        $publicAnswer = $answer.Substring(0, $markerIndex).Trim()
+        if ([string]::IsNullOrWhiteSpace($publicAnswer)) {
+            Write-JsonResponse -Response $Context.Response -StatusCode 502 -Data @{ error = 'El asistente no generó una respuesta para el cliente.' }
+            return
+        }
+
+        $closingPhrase = 'En cuanto tengamos más info te avisaremos.'
+        if (-not $publicAnswer.EndsWith($closingPhrase, [System.StringComparison]::Ordinal)) {
+            $publicAnswer = "$($publicAnswer.TrimEnd())`n`n$closingPhrase"
+        }
+
+        try {
+            $cases = @()
+            if (Test-Path -LiteralPath $assistantCasesPath) {
+                $storedCases = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($assistantCasesPath, [System.Text.Encoding]::UTF8))
+                if ($null -ne $storedCases) {
+                    $cases = @($storedCases)
+                }
+            }
+            $case = [PSCustomObject]@{
+                id = [Guid]::NewGuid().ToString()
+                createdAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+                status = 'pending'
+                customerName = if ([string]::IsNullOrWhiteSpace($customerName)) { 'Cliente sin identificar' } else { $customerName }
+                message = $requestData.message
+                note = $internalNote
+            }
+            $cases = @($case) + @($cases)
+            Save-AssistantCases -Cases $cases
+        } catch {
+            Write-Error "Could not save assistant escalation: $($_.Exception.Message)"
+            Write-JsonResponse -Response $Context.Response -StatusCode 500 -Data @{ error = 'No se pudo registrar el caso para Administración. Inténtalo nuevamente.' }
+            return
+        }
+    }
+
+    Write-JsonResponse -Response $Context.Response -StatusCode 200 -Data @{ text = $publicAnswer }
 }
 
 try {
@@ -545,6 +785,10 @@ try {
                 }
             } elseif ($path -eq '/js/app.js' -and $context.Request.HttpMethod -eq 'GET') {
                 $scriptPath = Join-Path $baseDirectory 'js\app.js'
+                $script = [System.IO.File]::ReadAllText($scriptPath, [System.Text.Encoding]::UTF8)
+                Write-Response -Response $context.Response -StatusCode 200 -ContentType 'application/javascript; charset=utf-8' -Body $script
+            } elseif ($path -eq '/js/assistant.js' -and $context.Request.HttpMethod -eq 'GET') {
+                $scriptPath = Join-Path $baseDirectory 'js\assistant.js'
                 $script = [System.IO.File]::ReadAllText($scriptPath, [System.Text.Encoding]::UTF8)
                 Write-Response -Response $context.Response -StatusCode 200 -ContentType 'application/javascript; charset=utf-8' -Body $script
             } elseif (($path -eq '/' -or $path -eq '/indexl.html') -and $context.Request.HttpMethod -eq 'GET') {

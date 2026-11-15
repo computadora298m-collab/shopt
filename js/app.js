@@ -102,10 +102,25 @@
             if (SHARED_STORAGE_KEYS.includes(event.key)) renderApp();
         });
 
+        const ASSISTANT_ICON_OPTIONS = [
+            { value: 'fa-wand-magic-sparkles', label: 'Destellos' },
+            { value: 'fa-robot', label: 'Robot' },
+            { value: 'fa-headset', label: 'Auriculares' },
+            { value: 'fa-comments', label: 'Conversación' },
+            { value: 'fa-lightbulb', label: 'Idea' },
+            { value: 'fa-bag-shopping', label: 'Compras' },
+            { value: 'fa-star', label: 'Estrella' }
+        ];
+
         const defaultSiteConfig = {
             siteName: 'Tienda',
             branchAddress: '',
             googleClientId: '',
+            assistantShippingPolicy: '',
+            assistantPaymentPolicy: '',
+            assistantCustomInstructions: '',
+            assistantIcon: 'fa-wand-magic-sparkles',
+            assistantColor: '#4f46e5',
             whatsappContacts: [],
             socialLinks: [],
             brandColor: '#6366f1',
@@ -129,6 +144,15 @@
             const config = stored ? { ...defaultSiteConfig, ...JSON.parse(stored) } : { ...defaultSiteConfig };
             config.whatsappContacts = Array.isArray(config.whatsappContacts) ? config.whatsappContacts : [];
             config.socialLinks = Array.isArray(config.socialLinks) ? config.socialLinks : [];
+            config.assistantIcon = ASSISTANT_ICON_OPTIONS.some(option => option.value === config.assistantIcon)
+                ? config.assistantIcon
+                : defaultSiteConfig.assistantIcon;
+            config.assistantColor = /^#[0-9a-f]{6}$/i.test(config.assistantColor)
+                ? config.assistantColor
+                : defaultSiteConfig.assistantColor;
+            config.assistantCustomInstructions = typeof config.assistantCustomInstructions === 'string'
+                ? config.assistantCustomInstructions
+                : '';
             return config;
         }
 
@@ -364,9 +388,7 @@
             container.replaceChildren();
             if (!clientId) {
                 container.innerHTML = `
-                    <button type="button" onclick="startGoogleSignIn()" class="w-full max-w-xs py-2.5 border border-slate-300 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-50 flex items-center justify-center gap-2">
-                        <i class="fa-brands fa-google text-red-500"></i> Continuar con Google
-                    </button>
+                    <p class="max-w-xs text-center text-xs text-slate-500">El inicio con Google aún no está configurado para esta tienda.</p>
                 `;
                 return;
             }
@@ -398,7 +420,7 @@
 
         function startGoogleSignIn() {
             if (!getSiteConfig().googleClientId.trim()) {
-                showToast('Administración debe configurar el Client ID de Google.', 'error');
+                showToast('El inicio con Google todavía no está habilitado para esta tienda.', 'error');
                 return;
             }
             if (!window.google || !window.google.accounts || !window.google.accounts.id) {
@@ -431,7 +453,9 @@
 
                 nativeStorageSetItem.call(localStorage, STORAGE_KEYS.USERS, JSON.stringify(result.users));
                 setCurrentUser(result.user);
-                showToast(`Bienvenido, ${result.user.name}`);
+                showToast(result.created
+                    ? `Cuenta creada con Google. ¡Bienvenido, ${result.user.name}!`
+                    : `Bienvenido, ${result.user.name}`);
             } catch (error) {
                 console.error('Error al iniciar sesión con Google:', error);
                 showToast(error.message || 'No se pudo iniciar sesión con Google.', 'error');
@@ -463,6 +487,14 @@
             const app = document.getElementById('app');
 
             const siteConfig = getSiteConfig();
+            if (typeof window.applyAssistantAppearance === 'function') {
+                window.applyAssistantAppearance(siteConfig);
+            }
+            if (typeof window.setAssistantAvailability === 'function') {
+                window.setAssistantAvailability(siteConfig.showAiAssistant);
+            }
+            if (window.prepareAssistantForUser) window.prepareAssistantForUser(user);
+            setupGoogleSignIn();
             document.documentElement.style.setProperty('--brand-color', siteConfig.brandColor);
             document.title = siteConfig.siteName;
 
@@ -555,95 +587,6 @@
         let customerActiveTab = 'catalog';
         let customerMenuOpen = false;
         let cart = [];
-        let isChatOpen = false;
-        let isAiRequestPending = false;
-
-        function toggleAiChat() {
-            isChatOpen = !isChatOpen;
-            const chatWindow = document.getElementById('ai-chat-window');
-            if (isChatOpen) {
-                chatWindow.classList.remove('hidden');
-            } else {
-                chatWindow.classList.add('hidden');
-            }
-        }
-
-        function appendAiChatMessage(message, isUser = false) {
-            const row = document.createElement('div');
-            row.className = isUser ? 'flex gap-2 justify-end' : 'flex gap-2';
-
-            if (!isUser) {
-                const avatar = document.createElement('div');
-                avatar.className = 'w-7 h-7 rounded-full bg-brand-600 text-white flex items-center justify-center flex-shrink-0 text-xs';
-                avatar.textContent = 'IA';
-                row.appendChild(avatar);
-            }
-
-            const bubble = document.createElement('div');
-            bubble.className = isUser
-                ? 'bg-brand-600 text-white p-3 rounded-2xl shadow-sm max-w-[80%] text-xs'
-                : 'bg-white p-3 rounded-2xl shadow-sm border border-slate-200 text-slate-700 text-xs';
-            bubble.textContent = message;
-            row.appendChild(bubble);
-
-            const messagesContainer = document.getElementById('ai-chat-messages');
-            messagesContainer.appendChild(row);
-            messagesContainer.scrollTop = messagesContainer.scrollHeight;
-            return row;
-        }
-
-        function handleAiChatSubmit(event) {
-            event.preventDefault();
-            sendAiMessage();
-        }
-
-        async function sendAiMessage() {
-            const inputEl = document.getElementById('ai-chat-input');
-            const submitButton = document.getElementById('ai-chat-submit');
-            const text = inputEl.value.trim();
-            if (!text || isAiRequestPending) return;
-
-            isAiRequestPending = true;
-            inputEl.disabled = true;
-            submitButton.disabled = true;
-            appendAiChatMessage(text, true);
-            inputEl.value = '';
-
-            const loadingMessage = appendAiChatMessage('Pensando respuesta...');
-
-            try {
-                const products = JSON.parse(localStorage.getItem(STORAGE_KEYS.PRODUCTS));
-                const siteName = getSiteConfig().siteName;
-                const response = await fetch('/api/gemini', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        message: text,
-                        siteName,
-                        products: products.map(product => ({
-                            name: product.name,
-                            price: product.price,
-                            description: product.description,
-                            stock: product.stock
-                        }))
-                    })
-                });
-                const result = await response.json();
-                if (!response.ok) {
-                    throw new Error(result.error || 'No se pudo contactar al servicio de Gemini.');
-                }
-                appendAiChatMessage(result.text);
-            } catch (error) {
-                console.error('Error al consultar el asistente virtual:', error);
-                appendAiChatMessage(error.message || 'No se pudo contactar al asistente. Comprueba que el servidor esté iniciado e inténtalo de nuevo.');
-            } finally {
-                loadingMessage.remove();
-                inputEl.disabled = false;
-                submitButton.disabled = false;
-                isAiRequestPending = false;
-                inputEl.focus();
-            }
-        }
 
         function renderCustomerLayout(user) {
             const products = JSON.parse(localStorage.getItem(STORAGE_KEYS.PRODUCTS));
@@ -664,7 +607,7 @@
                     <header class="bg-white border-b border-slate-200 sticky top-0 z-40 shadow-sm">
                         <div class="relative max-w-7xl mx-auto px-3 sm:px-6 lg:px-8 h-16 grid grid-cols-[1fr_auto_1fr] items-center">
                             <div></div>
-                            <button type="button" onclick="setCustomerTab('catalog')" class="min-w-0 max-w-[55vw] sm:max-w-md text-center truncate font-bold text-lg sm:text-3xl tracking-tight" aria-label="Ir al inicio">
+                            <button type="button" onclick="setCustomerTab('catalog')" class="min-w-0 max-w-[40vw] sm:max-w-md text-center truncate font-bold text-lg sm:text-3xl tracking-tight" aria-label="Ir al inicio">
                                 <span class="store-name-animated">${siteName}</span>
                             </button>
                             <div class="justify-self-end flex items-center gap-2">
@@ -683,7 +626,7 @@
                                     <i class="fa-solid ${customerMenuOpen ? 'fa-xmark' : 'fa-bars'} text-lg"></i>
                                 </button>
                             </div>
-                            <div id="customer-menu" class="${customerMenuOpen ? '' : 'hidden'} customer-menu-panel absolute right-3 sm:right-6 lg:right-8 top-full mt-2 w-[min(22rem,calc(100vw-1.5rem))] max-h-[75vh] overflow-y-auto rounded-2xl border border-slate-200 bg-white p-3 shadow-2xl">
+                            <div id="customer-menu" class="${customerMenuOpen ? '' : 'hidden'} customer-menu-panel absolute right-3 sm:right-6 lg:right-8 top-full mt-2 w-80 max-w-[calc(100vw-1.5rem)] max-h-[75vh] overflow-y-auto rounded-2xl border border-slate-200 bg-white p-3 shadow-2xl">
                                 <div class="px-3 py-2">
                                     ${user ? `
                                         <p class="text-sm font-bold text-slate-900">${escapeHtml(user.name)}</p>
@@ -1333,6 +1276,7 @@
                                 <button onclick="setAdminTab('products')" class="${adminActiveTab === 'products' ? 'text-brand-600 font-semibold' : 'text-slate-600 hover:text-slate-900'} transition">Productos</button>
                                 <button onclick="setAdminTab('orders')" class="${adminActiveTab === 'orders' ? 'text-brand-600 font-semibold' : 'text-slate-600 hover:text-slate-900'} transition">Pedidos</button>
                                 <button onclick="setAdminTab('users')" class="${adminActiveTab === 'users' ? 'text-brand-600 font-semibold' : 'text-slate-600 hover:text-slate-900'} transition">Usuarios y Roles</button>
+                                <button onclick="setAdminTab('assistant-cases')" class="${adminActiveTab === 'assistant-cases' ? 'text-brand-600 font-semibold' : 'text-slate-600 hover:text-slate-900'} transition">Casos del asistente</button>
                                 <button onclick="setAdminTab('customizer')" class="${adminActiveTab === 'customizer' ? 'text-brand-600 font-semibold border-b-2 border-brand-600 pb-1' : 'text-slate-600 hover:text-slate-900'} transition flex items-center gap-1.5"><i class="fa-solid fa-palette text-xs"></i> Apariencia y estructura</button>
                             </nav>
                             <div class="flex items-center gap-3">
@@ -1349,6 +1293,7 @@
                                 <option value="products" ${adminActiveTab === 'products' ? 'selected' : ''}>Productos</option>
                                 <option value="orders" ${adminActiveTab === 'orders' ? 'selected' : ''}>Pedidos</option>
                                 <option value="users" ${adminActiveTab === 'users' ? 'selected' : ''}>Usuarios y Roles</option>
+                                <option value="assistant-cases" ${adminActiveTab === 'assistant-cases' ? 'selected' : ''}>Casos del asistente</option>
                                 <option value="customizer" ${adminActiveTab === 'customizer' ? 'selected' : ''}>Apariencia y Estructura</option>
                             </select>
                         </div>
@@ -1359,6 +1304,17 @@
                         ${adminActiveTab === 'products' ? renderAdminProducts(products) : ''}
                         ${adminActiveTab === 'orders' ? renderAdminOrders(orders, archivedOrders) : ''}
                         ${adminActiveTab === 'users' ? renderAdminUsers(users) : ''}
+                        ${adminActiveTab === 'assistant-cases' ? `
+                            <section class="space-y-4">
+                                <div>
+                                    <h2 class="text-2xl font-bold text-slate-900">Casos derivados por el asistente</h2>
+                                    <p class="text-sm text-slate-500">Las consultas complejas se guardan aquí como notas internas para Administración General.</p>
+                                </div>
+                                <div id="assistant-case-list" class="space-y-4">
+                                    <p class="rounded-xl border border-slate-200 bg-white p-5 text-sm text-slate-500">Cargando casos...</p>
+                                </div>
+                            </section>
+                        ` : ''}
                         ${adminActiveTab === 'customizer' ? renderAdminCustomizer() : ''}
                     </main>
 
@@ -1374,6 +1330,80 @@
         function setAdminTab(tab) {
             adminActiveTab = tab;
             renderApp();
+        }
+
+        function renderAdminAssistantCases(cases) {
+            const container = document.getElementById('assistant-case-list');
+            if (!container) return;
+            if (cases.length === 0) {
+                container.innerHTML = '<p class="rounded-xl border border-slate-200 bg-white p-5 text-sm text-slate-500">No hay casos pendientes.</p>';
+                return;
+            }
+
+            container.innerHTML = cases.map(assistantCase => `
+                <article class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                    <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+                        <div>
+                            <p class="text-xs font-semibold uppercase tracking-wide text-slate-400">${assistantCase.status === 'resolved' ? 'Atendido' : 'Pendiente'} · ${escapeHtml(assistantCase.createdAt || '')}</p>
+                            <h3 class="mt-1 font-bold text-slate-900">${escapeHtml(assistantCase.customerName || 'Cliente sin identificar')}</h3>
+                            <p class="mt-2 text-sm text-slate-700">${escapeHtml(assistantCase.message || '')}</p>
+                        </div>
+                        ${assistantCase.status === 'resolved' ? '' : `
+                            <button type="button" onclick="resolveAssistantCase('${escapeHtml(assistantCase.id)}')" class="shrink-0 rounded-xl bg-emerald-50 px-4 py-2 text-xs font-semibold text-emerald-700 hover:bg-emerald-100">
+                                <i class="fa-solid fa-check mr-1"></i> Marcar atendido
+                            </button>
+                        `}
+                    </div>
+                    <pre class="mt-4 whitespace-pre-wrap rounded-xl bg-slate-50 p-4 text-xs text-slate-700">${escapeHtml(assistantCase.note || '')}</pre>
+                </article>
+            `).join('');
+        }
+
+        function getAssistantAdminHeaders() {
+            const user = getCurrentUser();
+            if (!user || user.role !== 'admin' || !user.pass) {
+                throw new Error('Vuelve a iniciar sesión como Administrador General para revisar los casos.');
+            }
+            return {
+                'X-Admin-Email': user.email,
+                'X-Admin-Password': user.pass
+            };
+        }
+
+        async function loadAssistantCases() {
+            const container = document.getElementById('assistant-case-list');
+            if (!container) return;
+            try {
+                const response = await fetch('/api/assistant-cases', {
+                    headers: getAssistantAdminHeaders()
+                });
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.error || 'No se pudieron cargar los casos.');
+                renderAdminAssistantCases(Array.isArray(result.cases) ? result.cases : []);
+            } catch (error) {
+                console.error('Error al cargar los casos del asistente:', error);
+                container.innerHTML = `<p class="rounded-xl border border-rose-200 bg-rose-50 p-5 text-sm text-rose-700">${escapeHtml(error.message || 'No se pudieron cargar los casos.')}</p>`;
+            }
+        }
+
+        async function resolveAssistantCase(caseId) {
+            try {
+                const response = await fetch('/api/assistant-cases', {
+                    method: 'PUT',
+                    headers: {
+                        ...getAssistantAdminHeaders(),
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ caseId, status: 'resolved' })
+                });
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.error || 'No se pudo actualizar el caso.');
+                renderAdminAssistantCases(Array.isArray(result.cases) ? result.cases : []);
+                showToast('Caso marcado como atendido.');
+            } catch (error) {
+                console.error('Error al actualizar el caso del asistente:', error);
+                showToast(error.message || 'No se pudo actualizar el caso.', 'error');
+            }
         }
 
         function getOrderProfit(order) {
@@ -1869,11 +1899,62 @@
                                 <p class="text-xs text-slate-500 mt-1">Es obligatorio configurarla antes de aceptar pedidos. Los clientes verán el mapa y el enlace de Google Maps generado con esta dirección.</p>
                             </div>
                             <div>
-                                <label for="cfg-googleClientId" class="block text-xs font-semibold text-slate-700 mb-2">Google OAuth Client ID para clientes</label>
+                                <label for="cfg-googleClientId" class="block text-xs font-semibold text-slate-700 mb-2">Client ID OAuth de Google de la tienda (configurar una vez)</label>
                                 <input type="text" id="cfg-googleClientId" value="${escapeHtml(config.googleClientId)}" maxlength="300" class="w-full max-w-2xl px-4 py-2.5 rounded-xl border border-slate-300 text-sm focus:ring-2 focus:ring-brand-500 outline-none" placeholder="1234567890-abc.apps.googleusercontent.com">
-                                <p class="text-xs text-slate-500 mt-1">Crea un ID de cliente OAuth web en Google Cloud y autoriza el origen de esta tienda (por ejemplo, http://127.0.0.1:8000).</p>
+                                <p class="text-xs ${config.googleClientId.trim() ? 'text-emerald-700' : 'text-amber-700'} mt-1">${config.googleClientId.trim() ? 'Google está habilitado. Los clientes pueden crear su cuenta y entrar con Google.' : 'Google está deshabilitado hasta que agregues un Client ID OAuth web.'}</p>
+                                <p class="text-xs text-slate-500 mt-1">Créalo en <a href="https://console.cloud.google.com/auth/clients" target="_blank" rel="noopener noreferrer" class="text-brand-600 underline">Google Cloud Console</a>. Configura la pantalla de consentimiento y autoriza el origen de esta tienda (por ejemplo, http://127.0.0.1:8000). Luego pega aquí el Client ID y guarda los cambios. No necesitas una clave secreta OAuth en el navegador.</p>
                             </div>
                         </div>
+
+                        <section class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
+                            <div>
+                                <h3 class="font-bold text-lg text-slate-900 flex items-center gap-2">
+                                    <i class="fa-solid fa-wand-magic-sparkles text-brand-600"></i> Apariencia e instrucciones del asistente
+                                </h3>
+                                <p class="text-sm text-slate-500 mt-1">Personaliza el ícono y el color del chat y agrega indicaciones para sus respuestas.</p>
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-6">
+                                <div>
+                                    <label for="cfg-assistantIcon" class="block text-xs font-semibold text-slate-700 mb-2">Ícono del asistente</label>
+                                    <select id="cfg-assistantIcon" class="w-full px-4 py-2.5 rounded-xl border border-slate-300 text-sm focus:ring-2 focus:ring-brand-500 outline-none bg-white">
+                                        ${ASSISTANT_ICON_OPTIONS.map(option => `<option value="${option.value}" ${config.assistantIcon === option.value ? 'selected' : ''}>${option.label}</option>`).join('')}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label for="cfg-assistantColor" class="block text-xs font-semibold text-slate-700 mb-2">Color del asistente</label>
+                                    <div class="flex items-center gap-3">
+                                        <input type="color" id="cfg-assistantColor" value="${config.assistantColor}" class="w-12 h-10 rounded-xl border border-slate-300 p-1 cursor-pointer">
+                                        <span class="text-xs font-mono text-slate-600 uppercase" id="cfg-assistantColor-val">${config.assistantColor}</span>
+                                        <span id="cfg-assistant-preview" class="w-10 h-10 rounded-full text-white flex items-center justify-center shadow-sm" style="background-color: ${config.assistantColor}">
+                                            <i id="cfg-assistant-preview-icon" class="fa-solid ${config.assistantIcon}"></i>
+                                        </span>
+                                        <span class="text-xs text-slate-500">Vista previa</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div>
+                                <label for="cfg-assistantCustomInstructions" class="block text-xs font-semibold text-slate-700 mb-2">Instrucciones adicionales</label>
+                                <textarea id="cfg-assistantCustomInstructions" rows="4" maxlength="3000" class="w-full px-4 py-2.5 rounded-xl border border-slate-300 text-sm focus:ring-2 focus:ring-brand-500 outline-none" placeholder="Ejemplo: prioriza recomendaciones económicas y responde siempre en español.">${escapeHtml(config.assistantCustomInstructions)}</textarea>
+                                <p class="text-xs text-slate-500 mt-1">Se agregan a las reglas base del asistente y no se muestran a los clientes. No incluyas claves ni contraseñas.</p>
+                            </div>
+                        </section>
+
+                        <section class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
+                            <div>
+                                <h3 class="font-bold text-lg text-slate-900 flex items-center gap-2">
+                                    <i class="fa-solid fa-headset text-brand-600"></i> Políticas para el asistente virtual
+                                </h3>
+                                <p class="text-sm text-slate-500 mt-1">Completa estos datos para que el asistente responda sobre envíos y pagos sin inventar políticas.</p>
+                            </div>
+                            <div>
+                                <label for="cfg-assistantShippingPolicy" class="block text-xs font-semibold text-slate-700 mb-2">Tiempos y condiciones de envío</label>
+                                <textarea id="cfg-assistantShippingPolicy" rows="2" maxlength="1000" class="w-full px-4 py-2.5 rounded-xl border border-slate-300 text-sm focus:ring-2 focus:ring-brand-500 outline-none" placeholder="Indica zonas, plazos habituales y condiciones">${escapeHtml(config.assistantShippingPolicy)}</textarea>
+                            </div>
+                            <div>
+                                <label for="cfg-assistantPaymentPolicy" class="block text-xs font-semibold text-slate-700 mb-2">Métodos de pago aceptados</label>
+                                <textarea id="cfg-assistantPaymentPolicy" rows="2" maxlength="1000" class="w-full px-4 py-2.5 rounded-xl border border-slate-300 text-sm focus:ring-2 focus:ring-brand-500 outline-none" placeholder="Indica los métodos de pago habilitados">${escapeHtml(config.assistantPaymentPolicy)}</textarea>
+                            </div>
+                        </section>
 
                         <section class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-6" aria-labelledby="cfg-contact-heading">
                             <div>
@@ -2019,11 +2100,12 @@
                                 </div>
 
                                 <div>
-                                    <label class="block text-xs font-semibold text-slate-700 mb-1">Asistente Virtual IA Gemini (Flotante)</label>
+                                    <label class="block text-xs font-semibold text-slate-700 mb-1">Asistente IA para toda la tienda</label>
                                     <select id="cfg-showAi" class="w-full px-4 py-2.5 rounded-xl border border-slate-300 text-sm focus:ring-2 focus:ring-brand-500 outline-none bg-white">
-                                        <option value="true" ${config.showAiAssistant ? 'selected' : ''}>Habilitado / Visible</option>
-                                        <option value="false" ${!config.showAiAssistant ? 'selected' : ''}>Deshabilitado / Oculto</option>
+                                        <option value="true" ${config.showAiAssistant ? 'selected' : ''}>Activado para todos</option>
+                                        <option value="false" ${!config.showAiAssistant ? 'selected' : ''}>Desactivado para todos</option>
                                     </select>
+                                    <p class="mt-1 text-xs text-slate-500">Se aplica a todos los clientes y dispositivos conectados a esta tienda.</p>
                                 </div>
 
                                 <div class="sm:col-span-2">
@@ -2093,6 +2175,11 @@
                 siteName,
                 branchAddress: document.getElementById('cfg-branchAddress').value.trim(),
                 googleClientId: document.getElementById('cfg-googleClientId').value.trim(),
+                assistantShippingPolicy: document.getElementById('cfg-assistantShippingPolicy').value.trim(),
+                assistantPaymentPolicy: document.getElementById('cfg-assistantPaymentPolicy').value.trim(),
+                assistantCustomInstructions: document.getElementById('cfg-assistantCustomInstructions').value.trim(),
+                assistantIcon: document.getElementById('cfg-assistantIcon').value,
+                assistantColor: document.getElementById('cfg-assistantColor').value,
                 whatsappContacts,
                 socialLinks,
                 brandColor: document.getElementById('cfg-brandColor').value,
@@ -2118,6 +2205,17 @@
             if (e.target.id === 'cfg-brandColor') document.getElementById('cfg-brandColor-val').textContent = e.target.value;
             if (e.target.id === 'cfg-gradientFrom') document.getElementById('cfg-gradientFrom-val').textContent = e.target.value;
             if (e.target.id === 'cfg-gradientTo') document.getElementById('cfg-gradientTo-val').textContent = e.target.value;
+            if (e.target.id === 'cfg-assistantColor') {
+                document.getElementById('cfg-assistantColor-val').textContent = e.target.value;
+                document.getElementById('cfg-assistant-preview').style.backgroundColor = e.target.value;
+            }
+        });
+
+        document.addEventListener('change', (e) => {
+            if (e.target.id === 'cfg-assistantIcon') {
+                const preview = document.getElementById('cfg-assistant-preview-icon');
+                preview.className = `fa-solid ${e.target.value}`;
+            }
         });
 
         function renderProductModal() {
@@ -2292,7 +2390,7 @@
                     <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                         <div>
                             <h2 class="text-2xl font-bold text-slate-900">Gestión Global de Personal y Clientes</h2>
-                            <p class="text-sm text-slate-500">Supervisa clientes y congela/pausa cuentas de empleados cuando lo requieras.</p>
+                            <p class="text-sm text-slate-500">Los clientes se registran automáticamente con Google. Desde aquí puedes suspender/reactivar o eliminar sus cuentas; también administrar al personal.</p>
                         </div>
                         <button onclick="openUserModal()" class="px-5 py-2.5 bg-brand-600 hover:bg-brand-700 text-white font-semibold rounded-xl text-sm shadow-md shadow-brand-600/30 transition flex items-center gap-2">
                             <i class="fa-solid fa-user-plus"></i> Nuevo Usuario
